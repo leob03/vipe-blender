@@ -183,10 +183,30 @@ class VipeProperties(bpy.types.PropertyGroup):
         description="Import the SLAM map as a coloured point cloud after processing",
         default=True,
     )
+    pointcloud_mode: EnumProperty(
+        name="Mode",
+        description="How to visualize the point cloud",
+        items=[
+            ('COMBINED',        'Combined',          'All SLAM keyframes merged into one point cloud'),
+            ('PER_FRAME',       'Per Frame',         'One SLAM point cloud per keyframe, animated visibility'),
+            ('PER_FRAME_DENSE', 'Per Frame (Dense)', 'Full-res depth maps reprojected per frame — heavy'),
+        ],
+        default='COMBINED',
+    )
+    depth_pcd_stride: IntProperty(
+        name="Depth Stride",
+        description="Sample every N-th depth pixel (1=full res, 4=default, 8=lighter). Higher = fewer points",
+        default=4, min=1, max=16,
+    )
     colored_pointcloud: BoolProperty(
         name="Vertex Colours",
         description="Apply an emission material driven by the point cloud vertex colours",
         default=True,
+    )
+    point_radius: FloatProperty(
+        name="Point Radius",
+        description="Display radius of each point in the point cloud",
+        default=0.005, min=0.0001, max=1.0, precision=4, step=0.1,
     )
 
     # --------------------------------------------------------- runtime state
@@ -195,6 +215,7 @@ class VipeProperties(bpy.types.PropertyGroup):
     last_stem: StringProperty()
     last_log_path: StringProperty()
     last_ply_path: StringProperty()
+    last_depth_pcd_path: StringProperty()
 
 
 def register():

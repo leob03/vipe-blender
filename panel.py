@@ -97,9 +97,16 @@ class VIPE_PT_Panel(bpy.types.Panel):
         col = box.column(align=True)
         col.prop(props, "import_pointcloud")
         if props.import_pointcloud:
-            sub = col.column()
-            sub.enabled = props.save_slam_map
+            sub = col.column(align=True)
+            sub.prop(props, "pointcloud_mode", text="")
+            if props.pointcloud_mode == 'PER_FRAME_DENSE':
+                sub.prop(props, "depth_pcd_stride")
+            else:
+                sub.enabled = props.save_slam_map
             sub.prop(props, "colored_pointcloud")
+            row = sub.row(align=True)
+            row.prop(props, "point_radius")
+            row.operator("vipe.set_point_radius", text="", icon='FILE_REFRESH')
         box.separator()
 
         row = box.row(align=True)

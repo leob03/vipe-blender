@@ -1,4 +1,5 @@
 import os
+import select
 import subprocess
 import shlex
 from pathlib import Path
@@ -18,15 +19,38 @@ _log_file = None
 # Timer callback — polls the subprocess every second
 # ---------------------------------------------------------------------------
 
+def _drain_stdout():
+    """Read all currently available bytes from the subprocess stdout."""
+    if _process is None or _process.stdout is None:
+        return
+    while True:
+        ready = select.select([_process.stdout], [], [], 0)[0]
+        if not ready:
+            break
+        chunk = os.read(_process.stdout.fileno(), 4096)
+        if not chunk:
+            break
+        text = chunk.decode('utf-8', errors='replace')
+        if _log_file:
+            _log_file.write(text)
+            _log_file.flush()
+        print(text, end='', flush=True)
+
+
 def _poll_process():
     global _process, _timer, _log_file
 
     if _process is None:
         return None  # cancel timer
 
+    _drain_stdout()
+
     retcode = _process.poll()
     if retcode is None:
         return 1.0  # still running
+
+    # Drain any remaining output after process exits
+    _drain_stdout()
 
     if _log_file:
         _log_file.close()
@@ -48,7 +72,7 @@ def _poll_process():
 
 
 def _resolve_ply_path(props):
-    """Find the PLY for the current run using the stored stem."""
+    """Find the PLY and dense depth PCD for the current run using the stored stem."""
     stem = props.last_stem
     out  = props.last_output_dir
     if not stem or not out:
@@ -56,6 +80,9 @@ def _resolve_ply_path(props):
     ply = os.path.join(out, "vipe", f"{stem}_slam_map.ply")
     if os.path.exists(ply):
         props.last_ply_path = ply
+    depth_pcd = os.path.join(out, "vipe", f"{stem}_depth_pcd.npz")
+    if os.path.exists(depth_pcd):
+        props.last_depth_pcd_path = depth_pcd
 
 
 def _import_results(props):
@@ -72,12 +99,32 @@ def _import_results(props):
     except Exception as e:
         print(f"[ViPE] Camera import failed: {e}")
 
-    if props.import_pointcloud and props.save_slam_map:
+    if not props.import_pointcloud:
+        return
+
+    from .importer import import_vipe_pointcloud
+    mode = props.pointcloud_mode
+
+    if mode == 'PER_FRAME_DENSE':
+        pcd_path = props.last_depth_pcd_path
+        if pcd_path and os.path.exists(pcd_path):
+            try:
+                import_vipe_pointcloud(pcd_path, colored=props.colored_pointcloud,
+                                       point_radius=props.point_radius,
+                                       mode=mode,
+                                       blender_start_frame=props.blender_start_frame)
+            except Exception as e:
+                print(f"[ViPE] Dense point cloud import failed: {e}")
+        else:
+            print("[ViPE] Dense PCD not found — re-run to generate it.")
+    elif props.save_slam_map:
         ply_path = props.last_ply_path
         if ply_path and os.path.exists(ply_path):
             try:
-                from .importer import import_vipe_pointcloud
-                import_vipe_pointcloud(ply_path, colored=props.colored_pointcloud)
+                import_vipe_pointcloud(ply_path, colored=props.colored_pointcloud,
+                                       point_radius=props.point_radius,
+                                       mode=mode,
+                                       blender_start_frame=props.blender_start_frame)
             except Exception as e:
                 print(f"[ViPE] Point cloud import failed: {e}")
 
@@ -195,9 +242,10 @@ class VIPE_OT_Run(bpy.types.Operator):
 
         stem = Path(input_path).stem
         props.last_output_dir = output_dir
-        props.last_stem       = stem
-        props.last_log_path   = os.path.join(output_dir, f"{stem}_vipe.log")
-        props.last_ply_path   = ""
+        props.last_stem           = stem
+        props.last_log_path       = os.path.join(output_dir, f"{stem}_vipe.log")
+        props.last_ply_path       = ""
+        props.last_depth_pcd_path = ""
 
         # --- locate conda ---
         try:
@@ -214,14 +262,22 @@ class VIPE_OT_Run(bpy.types.Operator):
         hydra_args = _build_hydra_args(props, input_path, output_dir)
         hydra_str  = " ".join(shlex.quote(a) for a in hydra_args)
 
-        run_py    = os.path.join(vipe_dir, "run.py")
-        addon_dir = os.path.dirname(os.path.abspath(__file__))
-        export_py = os.path.join(addon_dir, "export_ply.py")
+        run_py          = os.path.join(vipe_dir, "run.py")
+        addon_dir       = os.path.dirname(os.path.abspath(__file__))
+        export_ply_py   = os.path.join(addon_dir, "export_ply.py")
+        export_depth_py = os.path.join(addon_dir, "export_depth_pcd.py")
 
         vipe_cmd = f"python {shlex.quote(run_py)} {hydra_str}"
-        if props.save_slam_map and props.import_pointcloud:
-            vipe_cmd += (f" && python {shlex.quote(export_py)}"
-                         f" {shlex.quote(output_dir)} {shlex.quote(stem)}")
+
+        if props.import_pointcloud:
+            mode = props.pointcloud_mode
+            if props.save_slam_map and mode in ('COMBINED', 'PER_FRAME'):
+                vipe_cmd += (f" && python {shlex.quote(export_ply_py)}"
+                             f" {shlex.quote(output_dir)} {shlex.quote(stem)}")
+            if mode == 'PER_FRAME_DENSE':
+                vipe_cmd += (f" && python {shlex.quote(export_depth_py)}"
+                             f" {shlex.quote(output_dir)} {shlex.quote(stem)}"
+                             f" --stride {props.depth_pcd_stride}")
 
         bash_cmd = (
             f"source {shlex.quote(conda_sh)} && "
@@ -249,8 +305,9 @@ class VIPE_OT_Run(bpy.types.Operator):
         _process = subprocess.Popen(
             ["bash", "-c", bash_cmd],
             cwd=vipe_dir,
-            stdout=_log_file,
+            stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            bufsize=0,
             env=env,
         )
 
@@ -367,10 +424,59 @@ class VIPE_OT_ImportPointCloud(bpy.types.Operator):
         from .importer import import_vipe_pointcloud
         props = context.scene.vipe
         try:
-            import_vipe_pointcloud(self.filepath, colored=props.colored_pointcloud)
+            import_vipe_pointcloud(self.filepath, colored=props.colored_pointcloud,
+                                   point_radius=props.point_radius,
+                                   mode=props.pointcloud_mode,
+                                   blender_start_frame=props.blender_start_frame)
         except Exception as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
+        return {'FINISHED'}
+
+
+def _set_radius_on_obj(obj, radius: float) -> int:
+    """Set GeoNodes Radius on obj. Returns 1 if updated, 0 otherwise."""
+    mod = obj.modifiers.get("GeometryNodes")
+    if mod is None or mod.node_group is None:
+        return 0
+    for item in mod.node_group.interface.items_tree:
+        if item.name == "Radius":
+            mod[item.identifier] = float(radius)
+            obj.data.update()
+            return 1
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# VIPE_OT_SetPointRadius  (update radius on already-imported point cloud)
+# ---------------------------------------------------------------------------
+
+class VIPE_OT_SetPointRadius(bpy.types.Operator):
+    bl_idname      = "vipe.set_point_radius"
+    bl_label       = "Set Radius"
+    bl_description = "Update the display radius of the imported ViPE point cloud"
+
+    def execute(self, context):
+        import bpy as _bpy
+        radius = context.scene.vipe.point_radius
+        updated = 0
+
+        # Combined mode object
+        obj = _bpy.data.objects.get("VIPE_PointCloud")
+        if obj:
+            updated += _set_radius_on_obj(obj, radius)
+
+        # Per-frame collection objects
+        coll = _bpy.data.collections.get("VIPE_PointCloud_PerFrame")
+        if coll:
+            for obj in coll.objects:
+                updated += _set_radius_on_obj(obj, radius)
+
+        if updated == 0:
+            self.report({'WARNING'}, "No VIPE point cloud objects found in scene.")
+            return {'CANCELLED'}
+
+        self.report({'INFO'}, f"Radius updated on {updated} object(s).")
         return {'FINISHED'}
 
 
@@ -380,4 +486,5 @@ CLASSES = [
     VIPE_OT_OpenLog,
     VIPE_OT_ImportCamera,
     VIPE_OT_ImportPointCloud,
+    VIPE_OT_SetPointRadius,
 ]

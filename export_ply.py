@@ -62,10 +62,24 @@ def main() -> None:
     data = torch.load(slam_map_path, map_location="cpu", weights_only=False)
 
     xyz = data["dense_disp_xyz"].numpy()
-    rgb = data["dense_disp_rgb"].numpy()
+    rgb = data["dense_disp_rgb"].float().numpy()
 
     print(f"[export_ply] Writing {len(xyz):,} points → {ply_path}")
     write_ply(ply_path, xyz, rgb)
+
+    # Per-keyframe index mapping for animated import
+    if "dense_disp_packinfo" in data and "dense_disp_frame_inds" in data:
+        packinfo   = data["dense_disp_packinfo"].squeeze(1).numpy()  # (n_kf, 2)
+        frame_inds = np.array(data["dense_disp_frame_inds"], dtype=np.int64)
+        frames_npz = slam_map_path.with_name(slam_map_path.stem + "_frames.npz")
+        np.savez(
+            frames_npz,
+            starts=packinfo[:, 0].astype(np.int64),
+            counts=packinfo[:, 1].astype(np.int64),
+            frame_inds=frame_inds,
+        )
+        print(f"[export_ply] Wrote {len(frame_inds)} keyframe entries → {frames_npz}")
+
     print(f"[export_ply] Done.")
 
 
